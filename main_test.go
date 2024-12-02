@@ -6,7 +6,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"testing"
-	"time"
 )
 
 /*
@@ -28,14 +27,13 @@ CREATE TABLE public.test (
 
 func TestQuery(t *testing.T) {
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, "postgres://app:app@localhost:5432/postgres?sslmode=disable")
+	conn, err := pgx.Connect(ctx, "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close(ctx)
-	client := &Client{nil, conn, 1, "123", time.NewTimer(time.Second * 120)}
-	status, data := query(ctx, client, QueryRequest{SQL: "SELECT * FROM public.test where i64 = $1", Args: []any{int64(1)}})
+	status, data := query(ctx, conn, QueryRequest{SQL: "SELECT * FROM public.test where i64 = $1", Args: []any{int64(1)}})
 	assert.Equal(t, 200, status)
 	assert.Greater(t, len(data), 0)
-	fmt.Println(string(data))
+	fmt.Println(data)
 }

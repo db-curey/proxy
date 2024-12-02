@@ -15,7 +15,7 @@ CREATE TABLE public.test (
 
 INSERT INTO public.test
 (id, i64, i64_null, "varchar", "text", "jsonb", "bool", timestampz, bytes, i32_list, "decimal")
-VALUES(uuid_in(md5(random()::text || random()::text)::cstring), 1, null, 'hi', 'bye', '{"a":"b"}'::json, false, now(), '{1,2}'::bytea, '{1,2,3}'::integer[], 1.2345);
+VALUES(uuid_in(md5(random()::text || random()::text)::cstring), 1, 0, 'hi', 'bye', '{"a":"b"}'::json, false, now(), '{1,2}'::bytea, '{1,2,3}'::integer[], 1.2345);
 
 INSERT INTO public.test
 (id, i64, i64_null, "varchar", "text", "jsonb", "bool", timestampz, bytes, i32_list, "decimal")

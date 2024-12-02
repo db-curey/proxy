@@ -256,9 +256,6 @@ func query(ctx context.Context, cli Queryable, req QueryRequest) (status int, da
 }
 
 func makeOutput(rows pgx.Rows) (data []byte) {
-	a := rows.Next()
-	_ = a
-	rowsValue := rows.RawValues()
 	cols := rows.FieldDescriptions()
 	var (
 		l                   = uint16(len(cols))
@@ -271,6 +268,7 @@ func makeOutput(rows pgx.Rows) (data []byte) {
 		heapBuffLen         = uint32(0)
 		thisHeapLen         = uint32(0)
 		rowsCnt             = uint32(0)
+		nilCheck            = make([]bool, l)
 	)
 	_ = binary.Write(resBuff, binary.LittleEndian, l)
 	for i, col := range cols {
@@ -278,17 +276,20 @@ func makeOutput(rows pgx.Rows) (data []byte) {
 		binary.LittleEndian.AppendUint16(resBuff.Bytes(), columnsDataLen[i])
 		binary.LittleEndian.AppendUint32(resBuff.Bytes(), col.DataTypeOID)
 	}
-	if len(rowsValue) == 0 || l == 0 {
-		return []byte{}
-	}
 	for rows.Next() {
 		columnData = rows.RawValues()
 		rowsCnt++
+		nilCheck = make([]bool, l)
 		for i = 0; i < l; i++ {
 			// if i is fixed length write to stack
 			// else write to heap and write pointer to stack
 			if isColumnLengthFixed[i] {
-				_, _ = resBuff.Write(columnData[i]) // stack is already filled with fixed length columns
+				if columnData[i] == nil {
+					nilCheck[i] = true
+					resBuff.Write(make([]byte, columnsDataLen[i]))
+				} else {
+					_, _ = resBuff.Write(columnData[i]) // stack is already filled with fixed length columns
+				}
 			} else {
 				thisHeapLen = uint32(heapBuff.Len())
 				_ = binary.Write(resBuff, binary.LittleEndian, heapBuffLen)
@@ -297,12 +298,24 @@ func makeOutput(rows pgx.Rows) (data []byte) {
 				_, _ = heapBuff.Write(columnData[i])
 			}
 		}
+		_, _ = resBuff.Write(boolsToBytes(nilCheck))
+
 	}
 	_, _ = heapBuff.WriteTo(resBuff)
 	resData := resBuff.Bytes()
 	binary.LittleEndian.PutUint32(resData[0:4], uint32(len(resData)))
 	binary.LittleEndian.PutUint32(resData[4:8], rowsCnt)
 	return resData
+}
+
+func boolsToBytes(t []bool) []byte {
+	b := make([]byte, (len(t)+7)/8)
+	for i, x := range t {
+		if x {
+			b[i/8] |= 0x80 >> uint(i%8)
+		}
+	}
+	return b
 }
 
 func isFixedLengthColumnType(col pgconn.FieldDescription) (isFixedLenCol bool, fixLen uint16) {
