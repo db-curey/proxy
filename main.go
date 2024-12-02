@@ -12,6 +12,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -25,47 +26,45 @@ func main() {
 
 	// Define a route for the GET method on the root path '/'
 	app.Get("/connect", connectHandler)
+	app.Post("/tx/begin", beginTxHandler)
+	app.Post("/tx/commit", finishTxHandler)
+	app.Post("/tx/rollback", finishTxHandler)
 	app.Post("/query", queryHandler)
+	app.Post("/exec", execHandler)
 
 	// Start the server on port 3000
 	log.Fatal(app.Listen(":3000"))
 }
 
 var (
-	clients   = make([]*Client, math.MaxUint16)
-	clientSeq = new(uint32)
+	bgCtx, bgCancel = context.WithCancel(context.Background())
+	clients         = make([]*Client, math.MaxUint16)
+	clientSeq       = new(uint32)
 )
 
 type Client struct {
-	config *pgx.ConnConfig
-	conn   *pgx.Conn
-	id     uint32
-	token  string
-	expire *time.Timer
+	transactions   []pgx.Tx
+	token          string
+	conn           *pgx.Conn
+	expire         *time.Timer
+	id             uint32
+	transactionSeq uint32
 }
 
 func connectHandler(ctx fiber.Ctx) error {
 	queries := ctx.Queries()
-	config := &pgx.ConnConfig{}
-	config.Host, config.User, config.Password, config.Database = queries["host"], queries["user"], queries["password"], queries["dbname"]
-	if config.Host == "" || config.User == "" || config.Password == "" || config.Database == "" {
-		return ctx.Status(fiber.StatusBadRequest).JSON(map[string]string{"error": "Missing parameters"})
-	}
 	if queries["port"] != "" {
-		p, _ := strconv.ParseUint(queries["port"], 10, 16)
-		config.Port = uint16(p)
-	} else {
-		config.Port = 5432
+		queries["port"] = "5432"
 	}
-	conn, err := pgx.ConnectConfig(ctx.Context(), config)
+	conn, err := pgx.Connect(bgCtx, "postgres://"+queries["user"]+":"+queries["password"]+"@"+queries["host"]+":"+queries["port"]+"/"+queries["dbname"])
 	if err != nil {
 		return ctx.Status(fiber.StatusInternalServerError).JSON(map[string]string{"error": err.Error()})
 	}
 	c := &Client{
-		config: config,
-		conn:   conn,
-		token:  uuid.New().String(),
-		id:     atomic.AddUint32(clientSeq, 1),
+		conn:         conn,
+		token:        uuid.New().String(),
+		id:           atomic.AddUint32(clientSeq, 1),
+		transactions: make([]pgx.Tx, math.MaxUint16),
 	}
 	for {
 		if clients[c.id%math.MaxUint16] != nil {
@@ -76,9 +75,25 @@ func connectHandler(ctx fiber.Ctx) error {
 		}
 	}
 
-	c.expire = time.NewTimer(time.Second * 120)
+	go func() {
+		c.expire = time.NewTimer(time.Second * 3600)
+		<-c.expire.C
+		c.expire.Stop()
+		if clients[c.id%math.MaxUint16] == c {
+			clients[c.id%math.MaxUint16] = nil
+		}
+	}()
 
 	return ctx.Status(fiber.StatusOK).JSON(map[string]any{"token": c.token, "connectionId": c.id})
+}
+
+func getClient(req DbRequest) *Client {
+	cli := clients[req.ConnectionId%math.MaxUint16]
+	if cli != nil && cli.token == req.Token {
+		cli.expire.Reset(time.Second * 120)
+		return cli
+	}
+	return nil
 }
 
 type DbRequest struct {
@@ -93,23 +108,145 @@ type QueryRequest struct {
 	Args []any  `json:"args"`
 }
 
-func queryHandler(ctx fiber.Ctx) error {
-	req := QueryRequest{}
+func beginTxHandler(ctx fiber.Ctx) error {
+	req := DbRequest{}
 	err := json.Unmarshal(ctx.Body(), &req)
 	if err != nil {
 		return ctx.Status(fiber.StatusBadRequest).JSON(map[string]string{"error": err.Error()})
 	}
-	cli := clients[req.ConnectionId%math.MaxUint16]
-	if cli != nil && cli.token == req.Token {
-		statusCode, data := query(ctx.Context(), cli, req)
+	cli := getClient(req)
+	if cli != nil {
+		id, err := cli.BeginTx()
+		if err != nil {
+			return ctx.Status(fiber.StatusInternalServerError).JSON(map[string]string{"error": err.Error()})
+		}
+		return ctx.Status(fiber.StatusOK).JSON(map[string]uint32{"transaction_id": id})
+	}
+	return ctx.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token"})
+}
+
+func finishTxHandler(ctx fiber.Ctx) error {
+	req := DbRequest{}
+	err := json.Unmarshal(ctx.Body(), &req)
+	if err != nil {
+		return ctx.Status(fiber.StatusBadRequest).JSON(map[string]string{"error": err.Error()})
+	}
+	cli := getClient(req)
+	if cli != nil {
+		if req.TransactionID != "" {
+			txId, _ := strconv.ParseUint(req.TransactionID, 10, 64)
+			tx := cli.transactions[txId%math.MaxUint16]
+			if tx != nil {
+				var err error
+				if strings.Contains(ctx.BaseURL(), "/tx/rollback") {
+					err = tx.Rollback(ctx.Context())
+				} else if strings.Contains(ctx.BaseURL(), "/tx/commit") {
+					err = tx.Commit(ctx.Context())
+				}
+				if err != nil {
+					return ctx.Status(fiber.StatusInternalServerError).JSON(map[string]string{"error": err.Error()})
+				}
+				return ctx.Status(fiber.StatusOK).JSON(map[string]bool{"ok": true})
+			}
+		}
+	}
+	return ctx.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token"})
+}
+
+func (cli *Client) BeginTx() (id uint32, err error) {
+	ctx, _ := context.WithTimeout(bgCtx, time.Second*60)
+	tx, err := cli.conn.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	id = atomic.AddUint32(&cli.transactionSeq, 1)
+	cli.transactions[id%math.MaxUint16] = tx
+	return id, nil
+}
+
+type ExecRequest struct {
+	DbRequest
+	SQLs []string `json:"sqls"`
+	Args [][]any  `json:"args"`
+}
+
+func execHandler(ctx fiber.Ctx) error {
+	req := ExecRequest{}
+	err := json.Unmarshal(ctx.Body(), &req)
+	if err != nil {
+		return ctx.Status(fiber.StatusBadRequest).JSON(map[string]string{"error": err.Error()})
+	}
+	cli := getClient(req.DbRequest)
+	if cli != nil {
+		if req.TransactionID != "" {
+			txId, _ := strconv.ParseUint(req.TransactionID, 10, 64)
+			tx := cli.transactions[txId%math.MaxUint16]
+			defer func() {
+				cli.transactions[txId%math.MaxUint16] = nil
+			}()
+			if tx != nil {
+				statusCode, data := exec(ctx.Context(), tx, req)
+				return ctx.Status(statusCode).JSON(data)
+			}
+		}
+		statusCode, data := exec(ctx.Context(), cli.conn, req)
 		return ctx.Status(statusCode).JSON(data)
 	} else {
 		return ctx.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token"})
 	}
 }
 
-func query(ctx context.Context, cli *Client, req QueryRequest) (status int, data []byte) {
-	rows, err := cli.conn.Query(ctx, req.SQL, req.Args...)
+func queryHandler(ctx fiber.Ctx) error {
+	req := QueryRequest{}
+	err := json.Unmarshal(ctx.Body(), &req)
+	if err != nil {
+		return ctx.Status(fiber.StatusBadRequest).JSON(map[string]string{"error": err.Error()})
+	}
+	cli := getClient(req.DbRequest)
+	if cli != nil {
+		if req.TransactionID != "" {
+			txId, _ := strconv.ParseUint(req.TransactionID, 10, 64)
+			tx := cli.transactions[txId%math.MaxUint16]
+			if tx != nil {
+				statusCode, data := query(ctx.Context(), tx, req)
+				return ctx.Status(statusCode).JSON(data)
+			}
+		}
+		statusCode, data := query(ctx.Context(), cli.conn, req)
+		_, err = ctx.Status(statusCode).Write(data)
+		return err
+	} else {
+		return ctx.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token"})
+	}
+}
+
+type Queryable interface {
+	Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error)
+	Exec(ctx context.Context, sql string, arguments ...any) (commandTag pgconn.CommandTag, err error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+type ExecResult struct {
+	RowsAffected int64  `json:"rows_affected"`
+	Error        string `json:"error"`
+}
+
+func exec(ctx context.Context, cli Queryable, req ExecRequest) (status int, results []ExecResult) {
+	results = make([]ExecResult, len(req.SQLs))
+	for i, sql := range req.SQLs {
+		tag, err := cli.Exec(ctx, sql, req.Args[i]...)
+		if err != nil {
+			results[i].Error = err.Error()
+		}
+		if !tag.Select() {
+			results[i].RowsAffected = tag.RowsAffected()
+		}
+	}
+	return fiber.StatusOK, results
+}
+
+func query(ctx context.Context, cli Queryable, req QueryRequest) (status int, data []byte) {
+	rows, err := cli.Query(ctx, req.SQL, req.Args...)
 	if err != nil {
 		data, _ = json.Marshal(map[string]string{"error": err.Error()})
 		return fiber.StatusInternalServerError, data
