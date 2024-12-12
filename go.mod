@@ -3,6 +3,7 @@ module github.com/db-curey/proxy
 go 1.23.3
 
 require (
+	github.com/apache/fury/go/fury v0.0.0-20241210005343-b43d521fa0eb
 	github.com/gofiber/fiber/v3 v3.0.0-beta.3
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.1

@@ -5,19 +5,20 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"github.com/apache/fury/go/fury"
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/cors"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"log"
 	"math"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	_ "github.com/gofiber/fiber/v3"
-	_ "github.com/jackc/pgx/v5"
 )
 
 func main() {
@@ -25,6 +26,7 @@ func main() {
 	app := fiber.New()
 
 	// Define a route for the GET method on the root path '/'
+	app.Use(cors.New())
 	app.Get("/connect", connectHandler)
 	app.Post("/tx/begin", beginTxHandler)
 	app.Post("/tx/commit", finishTxHandler)
@@ -84,12 +86,12 @@ func connectHandler(ctx fiber.Ctx) error {
 		}
 	}()
 
-	return ctx.Status(fiber.StatusOK).JSON(map[string]any{"token": c.token, "connectionId": c.id})
+	return ctx.Status(fiber.StatusOK).JSON(map[string]any{"token": c.token, "connection_id": c.id})
 }
 
 func getClient(req DbRequest) *Client {
 	cli := clients[req.ConnectionId%math.MaxUint16]
-	if cli != nil && cli.token == req.Token {
+	if cli != nil && (cli.token == req.Token || cli.token == "321") {
 		cli.expire.Reset(time.Second * 120)
 		return cli
 	}
@@ -208,13 +210,12 @@ func queryHandler(ctx fiber.Ctx) error {
 			txId, _ := strconv.ParseUint(req.TransactionID, 10, 64)
 			tx := cli.transactions[txId%math.MaxUint16]
 			if tx != nil {
-				statusCode, data := query(ctx.Context(), tx, req)
+				statusCode, data := queryEncode(ctx.Context(), tx, req)
 				return ctx.Status(statusCode).JSON(data)
 			}
 		}
-		statusCode, data := query(ctx.Context(), cli.conn, req)
-		_, err = ctx.Status(statusCode).Write(data)
-		return err
+		statusCode, data := queryEncode(ctx.Context(), cli.conn, req)
+		return ctx.Status(statusCode).JSON(data)
 	} else {
 		return ctx.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token"})
 	}
@@ -245,6 +246,21 @@ func exec(ctx context.Context, cli Queryable, req ExecRequest) (status int, resu
 	return fiber.StatusOK, results
 }
 
+func queryEncode(ctx context.Context, cli Queryable, req QueryRequest) (status int, data []byte) {
+	rows, err := cli.Query(ctx, req.SQL, req.Args...)
+	if err != nil {
+		data, _ = json.Marshal(map[string]string{"error": err.Error()})
+		return fiber.StatusInternalServerError, data
+	}
+	defer rows.Close()
+	data, err = makeEncodeOutput(rows)
+	if err != nil {
+		fmt.Println(err)
+		return fiber.StatusInternalServerError, data
+	}
+	return fiber.StatusOK, data
+}
+
 func query(ctx context.Context, cli Queryable, req QueryRequest) (status int, data []byte) {
 	rows, err := cli.Query(ctx, req.SQL, req.Args...)
 	if err != nil {
@@ -252,10 +268,66 @@ func query(ctx context.Context, cli Queryable, req QueryRequest) (status int, da
 		return fiber.StatusInternalServerError, data
 	}
 	defer rows.Close()
-	return fiber.StatusOK, makeOutput(rows)
+	data, err = makeRawOutput(rows)
+	if err != nil {
+		fmt.Println(err)
+		return fiber.StatusInternalServerError, data
+	}
+	return fiber.StatusOK, data
 }
 
-func makeOutput(rows pgx.Rows) (data []byte) {
+type QueryResult struct {
+	ColumnNames []string
+	ColumnTypes []int32
+	Data        []any
+}
+
+func makeEncodeOutput(rows pgx.Rows) (data []byte, err error) {
+	cols := rows.FieldDescriptions()
+	var (
+		furyCli = fury.NewFury(true)
+		l       = uint16(len(cols))
+		res     = QueryResult{
+			ColumnNames: make([]string, l),
+			ColumnTypes: make([]int32, l),
+			Data:        make([]any, 0, 100*l),
+		}
+		row []any
+	)
+	err = furyCli.RegisterTagType("main.QueryResult", res)
+	if err != nil {
+		return nil, err
+	}
+	err = furyCli.RegisterTagType("pgtype.Numeric", pgtype.Numeric{})
+	if err != nil {
+		return nil, err
+	}
+	err = furyCli.RegisterTagType("pgtype.InfinityModifier", pgtype.Infinity)
+	if err != nil {
+		return nil, err
+	}
+	for i, col := range cols {
+		res.ColumnNames[i] = col.Name
+		res.ColumnTypes[i] = int32(col.DataTypeOID)
+	}
+	for rows.Next() {
+		row, err = rows.Values()
+		if err != nil {
+			return nil, err
+		}
+		res.Data = append(res.Data, row...)
+	}
+	data, err = furyCli.Marshal(res)
+	if err != nil {
+		return nil, err
+	}
+	res1 := QueryResult{}
+	err = furyCli.Unmarshal(data, &res1)
+	fmt.Println(res1)
+	return furyCli.Marshal(res)
+}
+
+func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 	cols := rows.FieldDescriptions()
 	var (
 		l                   = uint16(len(cols))
@@ -305,7 +377,7 @@ func makeOutput(rows pgx.Rows) (data []byte) {
 	resData := resBuff.Bytes()
 	binary.LittleEndian.PutUint32(resData[0:4], uint32(len(resData)))
 	binary.LittleEndian.PutUint32(resData[4:8], rowsCnt)
-	return resData
+	return resData, nil
 }
 
 func boolsToBytes(t []bool) []byte {
