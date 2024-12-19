@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -252,10 +253,15 @@ func query(ctx context.Context, cli Queryable, req QueryRequest) (status int, da
 		return fiber.StatusInternalServerError, data
 	}
 	defer rows.Close()
-	return fiber.StatusOK, makeOutput(rows)
+	data, err = makeRawOutput(rows)
+	if err != nil {
+		fmt.Println(err)
+		return fiber.StatusInternalServerError, data
+	}
+	return fiber.StatusOK, data
 }
 
-func makeOutput(rows pgx.Rows) (data []byte) {
+func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 	cols := rows.FieldDescriptions()
 	var (
 		l                   = uint16(len(cols))
@@ -273,8 +279,8 @@ func makeOutput(rows pgx.Rows) (data []byte) {
 	_ = binary.Write(resBuff, binary.LittleEndian, l)
 	for i, col := range cols {
 		isColumnLengthFixed[i], columnsDataLen[i] = isFixedLengthColumnType(col)
-		binary.LittleEndian.AppendUint16(resBuff.Bytes(), columnsDataLen[i])
-		binary.LittleEndian.AppendUint32(resBuff.Bytes(), col.DataTypeOID)
+		_ = binary.Write(resBuff, binary.LittleEndian, columnsDataLen[i])
+		_ = binary.Write(resBuff, binary.LittleEndian, uint16(col.DataTypeOID))
 	}
 	for rows.Next() {
 		columnData = rows.RawValues()
@@ -283,15 +289,13 @@ func makeOutput(rows pgx.Rows) (data []byte) {
 		for i = 0; i < l; i++ {
 			// if i is fixed length write to stack
 			// else write to heap and write pointer to stack
-			if isColumnLengthFixed[i] {
-				if columnData[i] == nil {
-					nilCheck[i] = true
-					resBuff.Write(make([]byte, columnsDataLen[i]))
-				} else {
-					_, _ = resBuff.Write(columnData[i]) // stack is already filled with fixed length columns
-				}
+			if columnData[i] == nil {
+				nilCheck[i] = true
+				resBuff.Write(make([]byte, columnsDataLen[i]))
+			} else if isColumnLengthFixed[i] {
+				_, _ = resBuff.Write(columnData[i]) // stack is already filled with fixed length columns
 			} else {
-				thisHeapLen = uint32(heapBuff.Len())
+				thisHeapLen = uint32(len(columnData[i]))
 				_ = binary.Write(resBuff, binary.LittleEndian, heapBuffLen)
 				_ = binary.Write(resBuff, binary.LittleEndian, thisHeapLen)
 				heapBuffLen += thisHeapLen
@@ -305,7 +309,7 @@ func makeOutput(rows pgx.Rows) (data []byte) {
 	resData := resBuff.Bytes()
 	binary.LittleEndian.PutUint32(resData[0:4], uint32(len(resData)))
 	binary.LittleEndian.PutUint32(resData[4:8], rowsCnt)
-	return resData
+	return resData, nil
 }
 
 func boolsToBytes(t []bool) []byte {
