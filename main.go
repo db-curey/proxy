@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/cors"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -24,6 +25,7 @@ import (
 func main() {
 	// Initialize a new Fiber app
 	app := fiber.New()
+	app.Use(cors.New())
 
 	// Define a route for the GET method on the root path '/'
 	app.Get("/connect", connectHandler)
@@ -90,23 +92,28 @@ func connectHandler(ctx fiber.Ctx) error {
 
 func getClient(req DbRequest) *Client {
 	cli := clients[req.ConnectionId%math.MaxUint16]
-	if cli != nil && cli.token == req.Token {
-		cli.expire.Reset(time.Second * 120)
-		return cli
+	if cli != nil {
+		if cli.token == req.Token {
+			cli.expire.Reset(time.Second * 120)
+			return cli
+		}
+		fmt.Println("invalid token", req.Token, cli.token)
+	} else {
+		fmt.Println("no client found", req)
 	}
 	return nil
 }
 
 type DbRequest struct {
-	Token         string `json:"token"`
-	ConnectionId  uint32 `json:"connection_id"`
-	TransactionID string `json:"transaction_id"`
+	Token         string
+	ConnectionId  uint32
+	TransactionID string
 }
 
 type QueryRequest struct {
 	DbRequest
-	SQL  string `json:"sql"`
-	Args []any  `json:"args"`
+	SQL  string
+	Args []any
 }
 
 func beginTxHandler(ctx fiber.Ctx) error {
@@ -267,7 +274,7 @@ func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 		l                   = uint16(len(cols))
 		isColumnLengthFixed = make([]bool, l)
 		columnsDataLen      = make([]uint16, l)
-		resBuff             = bytes.NewBuffer([]byte{0, 0, 0, 0, 0, 0, 0, 0}) //4 bytes for ttl len, 4 bytes for rows count
+		resBuff             = bytes.NewBuffer([]byte{0, 0, 0, 0}) //4 bytes for ttl len, 4 bytes for rows count
 		heapBuff            = bytes.NewBuffer(nil)
 		i                   uint16
 		columnData          [][]byte
@@ -276,11 +283,16 @@ func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 		rowsCnt             = uint32(0)
 		nilCheck            = make([]bool, l)
 	)
-	_ = binary.Write(resBuff, binary.LittleEndian, l)
+	_ = binary.Write(resBuff, binary.BigEndian, l)
 	for i, col := range cols {
 		isColumnLengthFixed[i], columnsDataLen[i] = isFixedLengthColumnType(col)
-		_ = binary.Write(resBuff, binary.LittleEndian, columnsDataLen[i])
-		_ = binary.Write(resBuff, binary.LittleEndian, uint16(col.DataTypeOID))
+		if isColumnLengthFixed[i] {
+			resBuff.WriteByte(1)
+		} else {
+			resBuff.WriteByte(0)
+		}
+		_ = binary.Write(resBuff, binary.BigEndian, columnsDataLen[i])
+		_ = binary.Write(resBuff, binary.BigEndian, uint16(col.DataTypeOID))
 	}
 	for rows.Next() {
 		columnData = rows.RawValues()
@@ -296,8 +308,8 @@ func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 				_, _ = resBuff.Write(columnData[i]) // stack is already filled with fixed length columns
 			} else {
 				thisHeapLen = uint32(len(columnData[i]))
-				_ = binary.Write(resBuff, binary.LittleEndian, heapBuffLen)
-				_ = binary.Write(resBuff, binary.LittleEndian, thisHeapLen)
+				_ = binary.Write(resBuff, binary.BigEndian, heapBuffLen)
+				_ = binary.Write(resBuff, binary.BigEndian, thisHeapLen)
 				heapBuffLen += thisHeapLen
 				_, _ = heapBuff.Write(columnData[i])
 			}
@@ -307,8 +319,7 @@ func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 	}
 	_, _ = heapBuff.WriteTo(resBuff)
 	resData := resBuff.Bytes()
-	binary.LittleEndian.PutUint32(resData[0:4], uint32(len(resData)))
-	binary.LittleEndian.PutUint32(resData[4:8], rowsCnt)
+	binary.BigEndian.PutUint32(resData[0:4], rowsCnt)
 	return resData, nil
 }
 
@@ -316,7 +327,7 @@ func boolsToBytes(t []bool) []byte {
 	b := make([]byte, (len(t)+7)/8)
 	for i, x := range t {
 		if x {
-			b[i/8] |= 0x80 >> uint(i%8)
+			b[i/8] += 1 << (i % 8)
 		}
 	}
 	return b
