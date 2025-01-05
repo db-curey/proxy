@@ -293,6 +293,8 @@ func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 		}
 		_ = binary.Write(resBuff, binary.BigEndian, columnsDataLen[i])
 		_ = binary.Write(resBuff, binary.BigEndian, uint16(col.DataTypeOID))
+		_ = binary.Write(resBuff, binary.BigEndian, uint16(len(col.Name)))
+		resBuff.WriteString(col.Name)
 	}
 	for rows.Next() {
 		columnData = rows.RawValues()
