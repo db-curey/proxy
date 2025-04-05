@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"log"
 	"math"
 	"strconv"
@@ -48,7 +49,7 @@ var (
 type Client struct {
 	transactions   []pgx.Tx
 	token          string
-	conn           *pgx.Conn
+	conn           *pgxpool.Pool
 	expire         *time.Timer
 	id             uint32
 	transactionSeq uint32
@@ -59,7 +60,7 @@ func connectHandler(ctx fiber.Ctx) error {
 	if queries["port"] != "" {
 		queries["port"] = "5432"
 	}
-	conn, err := pgx.Connect(bgCtx, "postgres://"+queries["user"]+":"+queries["password"]+"@"+queries["host"]+":"+queries["port"]+"/"+queries["dbname"])
+	conn, err := pgxpool.New(bgCtx, "postgres://"+queries["user"]+":"+queries["password"]+"@"+queries["host"]+":"+queries["port"]+"/"+queries["dbname"])
 	if err != nil {
 		return ctx.Status(fiber.StatusInternalServerError).JSON(map[string]string{"error": err.Error()})
 	}
@@ -229,7 +230,7 @@ func queryHandler(ctx fiber.Ctx) error {
 }
 
 type Queryable interface {
-	Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error)
+	//Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error)
 	Exec(ctx context.Context, sql string, arguments ...any) (commandTag pgconn.CommandTag, err error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
@@ -282,6 +283,7 @@ func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 		thisHeapLen         = uint32(0)
 		rowsCnt             = uint32(0)
 		nilCheck            = make([]bool, l)
+		dataLen             = uint16(0)
 	)
 	_ = binary.Write(resBuff, binary.BigEndian, l)
 	for i, col := range cols {
@@ -307,6 +309,10 @@ func makeRawOutput(rows pgx.Rows) (data []byte, err error) {
 				nilCheck[i] = true
 				resBuff.Write(make([]byte, columnsDataLen[i]))
 			} else if isColumnLengthFixed[i] {
+				dataLen = uint16(len(columnData[i]))
+				if columnsDataLen[i] != dataLen {
+					columnData[i] = append(columnData[i], make([]byte, columnsDataLen[i]-dataLen)...)
+				}
 				_, _ = resBuff.Write(columnData[i]) // stack is already filled with fixed length columns
 			} else {
 				thisHeapLen = uint32(len(columnData[i]))
