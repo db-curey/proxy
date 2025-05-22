@@ -80,9 +80,10 @@ func connectHandler(ctx fiber.Ctx) error {
 	}
 
 	go func() {
-		c.expire = time.NewTimer(time.Second * 3600)
+		c.expire = time.NewTimer(time.Second * 120)
 		<-c.expire.C
 		c.expire.Stop()
+		c.conn.Close()
 		if clients[c.id%math.MaxUint16] == c {
 			clients[c.id%math.MaxUint16] = nil
 		}
